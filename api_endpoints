@@ -1,0 +1,262 @@
+import websocket
+import uuid
+import json
+import urllib.request
+import urllib.parse
+from PIL import Image
+import io
+import base64
+from flask import Flask, request, jsonify, send_file
+import numpy as np
+from typing import Optional, Dict, Any
+
+class ComfyUIHandler:
+    def __init__(self, server_address="127.0.0.1:8188"):
+        self.server_address = server_address
+        self.client_id = str(uuid.uuid4())
+        
+    # ... [Previous methods remain the same] ...
+
+    def create_style_transfer_prompt(self, input_image: Image.Image, style_prompt: str) -> Dict[str, Any]:
+        buffered = io.BytesIO()
+        input_image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        return {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": img_str}
+            },
+            "2": {
+                "class_type": "VAEEncode",
+                "inputs": {
+                    "image": ["1", 0],
+                    "vae": ["3", 2]
+                }
+            },
+            "3": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {
+                    "ckpt_name": "sd_xl_base_1.0.safetensors"
+                }
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "clip": ["3", 1],
+                    "text": f"masterpiece, best quality, {style_prompt}"
+                }
+            },
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "cfg": 6.5,
+                    "denoise": 0.6,
+                    "latent_image": ["2", 0],
+                    "model": ["3", 0],
+                    "negative": ["6", 0],
+                    "positive": ["4", 0],
+                    "sampler_name": "euler_ancestral",
+                    "scheduler": "karras",
+                    "seed": np.random.randint(1, 1000000),
+                    "steps": 25
+                }
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "clip": ["3", 1],
+                    "text": "bad quality, blurry, distorted"
+                }
+            },
+            "7": {
+                "class_type": "VAEDecode",
+                "inputs": {
+                    "samples": ["5", 0],
+                    "vae": ["3", 2]
+                }
+            },
+            "8": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "filename_prefix": "style_transfer",
+                    "images": ["7", 0]
+                }
+            }
+        }
+
+    def create_portrait_enhancement_prompt(self, input_image: Image.Image, enhancement_level: str = "medium") -> Dict[str, Any]:
+        buffered = io.BytesIO()
+        input_image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Adjust parameters based on enhancement level
+        denoise_levels = {"light": 0.3, "medium": 0.5, "heavy": 0.7}
+        denoise = denoise_levels.get(enhancement_level, 0.5)
+        
+        return {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": img_str}
+            },
+            "2": {
+                "class_type": "FloenceImageProcessor",
+                "inputs": {
+                    "image": ["1", 0],
+                    "face_detection": True,
+                    "enhancement_strength": enhancement_level
+                }
+            },
+            "3": {
+                "class_type": "FaceDetailer",
+                "inputs": {
+                    "image": ["2", 0],
+                    "denoise": denoise,
+                    "face_resolution": 512
+                }
+            },
+            "4": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "filename_prefix": "enhanced_portrait",
+                    "images": ["3", 0]
+                }
+            }
+        }
+
+    def create_background_removal_prompt(self, input_image: Image.Image) -> Dict[str, Any]:
+        buffered = io.BytesIO()
+        input_image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        return {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": img_str}
+            },
+            "2": {
+                "class_type": "FloenceImageProcessor",
+                "inputs": {
+                    "image": ["1", 0],
+                    "segment_person": True
+                }
+            },
+            "3": {
+                "class_type": "AlphaMask",
+                "inputs": {
+                    "image": ["1", 0],
+                    "mask": ["2", 1]
+                }
+            },
+            "4": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "filename_prefix": "removed_background",
+                    "images": ["3", 0]
+                }
+            }
+        }
+
+app = Flask(__name__)
+handler = ComfyUIHandler()
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'service': 'ComfyUI API Handler'})
+
+@app.route('/swap_background', methods=['POST'])
+async def swap_background():
+    try:
+        file = request.files['image']
+        target_background = request.form['background_prompt']
+        preserve_person = request.form.get('preserve_person', 'true').lower() == 'true'
+        
+        input_image = Image.open(file.stream)
+        prompt = handler.create_img2img_prompt(input_image, target_background, preserve_person)
+        
+        ws = handler.connect_websocket()
+        images = handler.get_images(ws, prompt)
+        ws.close()
+        
+        if images and '9' in images and images['9']:
+            return send_file(
+                io.BytesIO(images['9'][0]),
+                mimetype='image/png'
+            )
+        return jsonify({'error': 'Image processing failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/style_transfer', methods=['POST'])
+async def style_transfer():
+    try:
+        file = request.files['image']
+        style_prompt = request.form['style_prompt']
+        
+        input_image = Image.open(file.stream)
+        prompt = handler.create_style_transfer_prompt(input_image, style_prompt)
+        
+        ws = handler.connect_websocket()
+        images = handler.get_images(ws, prompt)
+        ws.close()
+        
+        if images and '8' in images and images['8']:
+            return send_file(
+                io.BytesIO(images['8'][0]),
+                mimetype='image/png'
+            )
+        return jsonify({'error': 'Style transfer failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/enhance_portrait', methods=['POST'])
+async def enhance_portrait():
+    try:
+        file = request.files['image']
+        enhancement_level = request.form.get('enhancement_level', 'medium')
+        
+        if enhancement_level not in ['light', 'medium', 'heavy']:
+            return jsonify({'error': 'Invalid enhancement level'}), 400
+            
+        input_image = Image.open(file.stream)
+        prompt = handler.create_portrait_enhancement_prompt(input_image, enhancement_level)
+        
+        ws = handler.connect_websocket()
+        images = handler.get_images(ws, prompt)
+        ws.close()
+        
+        if images and '4' in images and images['4']:
+            return send_file(
+                io.BytesIO(images['4'][0]),
+                mimetype='image/png'
+            )
+        return jsonify({'error': 'Portrait enhancement failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/remove_background', methods=['POST'])
+async def remove_background():
+    try:
+        file = request.files['image']
+        input_image = Image.open(file.stream)
+        prompt = handler.create_background_removal_prompt(input_image)
+        
+        ws = handler.connect_websocket()
+        images = handler.get_images(ws, prompt)
+        ws.close()
+        
+        if images and '4' in images and images['4']:
+            return send_file(
+                io.BytesIO(images['4'][0]),
+                mimetype='image/png'
+            )
+        return jsonify({'error': 'Background removal failed'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.1', port=5000)
